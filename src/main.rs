@@ -22,12 +22,8 @@ async fn main() {
     let (tx, mut rx) = mpsc::channel::<WatchEvent>(100);
 
     let watch_dir_clone = watch_dir.clone();
-    tokio::spawn(async move {
-        tokio::task::spawn_blocking(move || {
-            watcher::start_watcher(watch_dir_clone, tx);
-        })
-        .await
-        .ok();
+    tokio::task::spawn_blocking(move || {
+        watcher::start_watcher(watch_dir_clone, tx);
     });
 
     // Event consumer — logs now, DB insert in Day 9
