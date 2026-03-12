@@ -1,11 +1,13 @@
 mod db;
 mod exif;
+mod handlers;
 mod ingestor;
+mod models;
 mod watcher;
 
 use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
-use std::{env, path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 use watcher::{WatchEvent, WatchEventKind};
@@ -26,7 +28,7 @@ async fn main() {
         .unwrap_or_else(|_| "00000000-0000-0000-0000-000000000001".to_string());
     let owner_id: Uuid = owner_id.parse().expect("INGEST_OWNER_ID must be a valid UUID");
 
-    let pool = Arc::new(db::create_pool(&db_url).await);
+    let pool = db::create_pool(&db_url).await;
 
     // File system watcher pipeline
     let (tx, mut rx) = mpsc::channel::<WatchEvent>(100);
@@ -37,7 +39,7 @@ async fn main() {
     });
 
     // Event consumer — ingest Created/Renamed images into DB
-    let pool_consumer = Arc::clone(&pool);
+    let pool_consumer = pool.clone();
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             match &event.kind {
@@ -54,9 +56,14 @@ async fn main() {
         }
     });
 
-    let addr = format!("0.0.0.0:{port}");
-    let app = Router::new().route("/health", get(health));
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/api/images", get(handlers::list_images))
+        .route("/api/images/:id", get(handlers::get_image))
+        .route("/api/images/:id/file", get(handlers::stream_image))
+        .with_state(pool);
 
+    let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     tracing::info!("nesoli-gallery listening on {addr}, watching {}", watch_dir.display());
     axum::serve(listener, app).await.unwrap();
