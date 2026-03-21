@@ -3,11 +3,12 @@ mod exif;
 mod handlers;
 mod ingestor;
 mod models;
+mod storage;
 mod watcher;
 
 use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 use watcher::{WatchEvent, WatchEventKind};
@@ -28,7 +29,15 @@ async fn main() {
         .unwrap_or_else(|_| "00000000-0000-0000-0000-000000000001".to_string());
     let owner_id: Uuid = owner_id.parse().expect("INGEST_OWNER_ID must be a valid UUID");
 
+    let minio_endpoint = env::var("MINIO_ENDPOINT").unwrap_or_else(|_| "http://minio:9000".to_string());
+    let minio_user     = env::var("MINIO_USER").expect("MINIO_USER must be set");
+    let minio_pass     = env::var("MINIO_PASS").expect("MINIO_PASS must be set");
+    let minio_bucket   = env::var("MINIO_BUCKET").unwrap_or_else(|_| "gallery".to_string());
+
     let pool = db::create_pool(&db_url).await;
+    let s3 = Arc::new(
+        storage::S3Storage::init(&minio_endpoint, &minio_user, &minio_pass, &minio_bucket).await,
+    );
 
     // File system watcher pipeline
     let (tx, mut rx) = mpsc::channel::<WatchEvent>(100);
@@ -38,13 +47,14 @@ async fn main() {
         watcher::start_watcher(watch_dir_clone, tx);
     });
 
-    // Event consumer — ingest Created/Renamed images into DB
+    // Event consumer — ingest Created/Renamed images into DB + upload to MinIO
     let pool_consumer = pool.clone();
+    let s3_consumer = Arc::clone(&s3);
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             match &event.kind {
                 WatchEventKind::Created | WatchEventKind::Renamed { .. } => {
-                    ingestor::ingest_image(&pool_consumer, owner_id, &event).await;
+                    ingestor::ingest_image(&pool_consumer, owner_id, &event, &s3_consumer).await;
                 }
                 WatchEventKind::Modified => {
                     tracing::debug!(path = %event.path.display(), "✏️  image modified (skipping re-ingest)");
