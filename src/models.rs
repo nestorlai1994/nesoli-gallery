@@ -1,6 +1,31 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sqlx::PgPool;
+use std::sync::Arc;
 use uuid::Uuid;
+
+use crate::storage::S3Storage;
+
+/// Shared application state for all Axum handlers.
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: PgPool,
+    pub storage: Arc<S3Storage>,
+}
+
+/// Allow handlers that extract `State<PgPool>` to keep working unchanged.
+impl axum::extract::FromRef<AppState> for PgPool {
+    fn from_ref(state: &AppState) -> Self {
+        state.pool.clone()
+    }
+}
+
+/// Allow handlers to extract `State<Arc<S3Storage>>`.
+impl axum::extract::FromRef<AppState> for Arc<S3Storage> {
+    fn from_ref(state: &AppState) -> Self {
+        state.storage.clone()
+    }
+}
 
 /// Full gallery_images row — returned by GET /api/images/:id
 #[derive(Debug, Serialize, sqlx::FromRow)]

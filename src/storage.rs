@@ -5,6 +5,13 @@ use aws_sdk_s3::{
 };
 use std::path::Path;
 
+/// Result of a successful GetObject call — ready for streaming.
+pub struct S3Object {
+    pub body: ByteStream,
+    pub content_type: String,
+    pub content_length: i64,
+}
+
 pub struct S3Storage {
     client: Client,
     bucket: String,
@@ -68,5 +75,29 @@ impl S3Storage {
 
         tracing::info!(key = %key, bucket = %self.bucket, "uploaded to MinIO");
         Ok(())
+    }
+
+    /// Stream an object from MinIO by key.
+    pub async fn get_object_stream(&self, key: &str) -> Result<S3Object, String> {
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| format!("failed to get object from MinIO: {}", e))?;
+
+        let content_type = resp
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let content_length = resp.content_length().unwrap_or(0);
+
+        Ok(S3Object {
+            body: resp.body,
+            content_type,
+            content_length,
+        })
     }
 }

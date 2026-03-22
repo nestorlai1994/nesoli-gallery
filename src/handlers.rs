@@ -6,11 +6,12 @@ use axum::{
     Json,
 };
 use sqlx::PgPool;
-use tokio::fs::File;
+use std::sync::Arc;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::models::{ImageListResponse, ImageRecord, ImageSummary, PaginationParams};
+use crate::storage::S3Storage;
 
 pub async fn list_images(
     Query(params): Query<PaginationParams>,
@@ -75,32 +76,37 @@ pub async fn get_image(
 pub async fn stream_image(
     Path(id): Path<Uuid>,
     State(pool): State<PgPool>,
+    State(storage): State<Arc<S3Storage>>,
 ) -> Result<Response, StatusCode> {
-    let row: (String, String, i64) = sqlx::query_as(
-        "SELECT original_path, mime_type, size_bytes FROM gallery_images WHERE id = $1",
+    let row: (String,) = sqlx::query_as(
+        "SELECT storage_path FROM gallery_images WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&pool)
     .await
     .map_err(|e| {
-        tracing::error!(error = %e, id = %id, "failed to fetch image path");
+        tracing::error!(error = %e, id = %id, "failed to fetch image storage_path");
         StatusCode::INTERNAL_SERVER_ERROR
     })?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    let (path, mime_type, size_bytes) = row;
+    let storage_path = row.0;
+    if storage_path.is_empty() {
+        tracing::warn!(id = %id, "storage_path is empty — image not yet uploaded to MinIO");
+        return Err(StatusCode::NOT_FOUND);
+    }
 
-    let file = File::open(&path).await.map_err(|e| {
-        tracing::error!(error = %e, path = %path, "file not found on disk");
+    let obj = storage.get_object_stream(&storage_path).await.map_err(|e| {
+        tracing::error!(error = %e, id = %id, key = %storage_path, "failed to stream from MinIO");
         StatusCode::NOT_FOUND
     })?;
 
-    let stream = ReaderStream::new(file);
+    let stream = ReaderStream::new(obj.body.into_async_read());
     let body = Body::from_stream(stream);
 
     Ok(Response::builder()
-        .header(header::CONTENT_TYPE, mime_type)
-        .header(header::CONTENT_LENGTH, size_bytes)
+        .header(header::CONTENT_TYPE, obj.content_type)
+        .header(header::CONTENT_LENGTH, obj.content_length)
         .body(body)
         .unwrap())
 }
