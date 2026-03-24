@@ -4,8 +4,19 @@ use std::fs;
 use uuid::Uuid;
 
 /// Ingest a newly discovered image file into the gallery_images table,
-/// upload it to MinIO, generate thumbnails, and update storage_path.
-pub async fn ingest_image(pool: &PgPool, owner_id: Uuid, event: &WatchEvent, storage: &S3Storage) {
+/// upload it to MinIO, generate thumbnails, and optionally clean up the local file.
+///
+/// Image lifecycle (strict order — data safety rule):
+///   1. DB INSERT → 2. MinIO original → 3. DB UPDATE storage_path
+///   → 4. generate thumb+preview → 5. MinIO thumb+preview → 6. DB UPDATE processed
+///   → 7. ONLY if inbox_cleanup=true AND all steps succeeded → delete local file
+pub async fn ingest_image(
+    pool: &PgPool,
+    owner_id: Uuid,
+    event: &WatchEvent,
+    storage: &S3Storage,
+    inbox_cleanup: bool,
+) {
     let path = &event.path;
 
     let filename = match path.file_name().and_then(|n| n.to_str()) {
@@ -92,7 +103,7 @@ pub async fn ingest_image(pool: &PgPool, owner_id: Uuid, event: &WatchEvent, sto
     );
 
     // Step 3: Generate thumbnail + preview (non-blocking on failure)
-    match processor::generate_variants(path, id).await {
+    let all_uploads_ok = match processor::generate_variants(path, id).await {
         Ok(images) => {
             let thumb_key = format!("{}/{}/thumb.webp", owner_id, id);
             let preview_key = format!("{}/{}/preview.webp", owner_id, id);
@@ -104,7 +115,7 @@ pub async fn ingest_image(pool: &PgPool, owner_id: Uuid, event: &WatchEvent, sto
                 .upload_file(&preview_key, &images.preview_path, "image/webp")
                 .await;
 
-            if let (Ok(()), Ok(())) = (&thumb_ok, &preview_ok) {
+            let variants_ok = if let (Ok(()), Ok(())) = (&thumb_ok, &preview_ok) {
                 let update = sqlx::query(
                     "UPDATE gallery_images SET thumbnail_path = $1, preview_path = $2, processed = true WHERE id = $3",
                 )
@@ -116,8 +127,10 @@ pub async fn ingest_image(pool: &PgPool, owner_id: Uuid, event: &WatchEvent, sto
 
                 if let Err(e) = update {
                     tracing::error!(id = %id, error = %e, "❌ failed to update thumbnail_path");
+                    false
                 } else {
                     tracing::info!(id = %id, thumb = %thumb_key, preview = %preview_key, "✅ thumbnails uploaded");
+                    true
                 }
             } else {
                 if let Err(e) = thumb_ok {
@@ -126,12 +139,29 @@ pub async fn ingest_image(pool: &PgPool, owner_id: Uuid, event: &WatchEvent, sto
                 if let Err(e) = preview_ok {
                     tracing::error!(id = %id, error = %e, "❌ failed to upload preview");
                 }
-            }
+                false
+            };
 
             processor::cleanup_work_dir(id).await;
+            variants_ok
         }
         Err(e) => {
             tracing::warn!(id = %id, error = %e, "⚠️ thumbnail generation failed (image still accessible as original)");
+            false
         }
+    };
+
+    // Step 4: Inbox cleanup — delete local file ONLY if everything succeeded
+    if inbox_cleanup && all_uploads_ok {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {
+                tracing::info!(id = %id, path = %path.display(), "🧹 inbox cleanup: local file deleted");
+            }
+            Err(e) => {
+                tracing::warn!(id = %id, path = %path.display(), error = %e, "⚠️ inbox cleanup: failed to delete local file");
+            }
+        }
+    } else if inbox_cleanup && !all_uploads_ok {
+        tracing::warn!(id = %id, path = %path.display(), "⚠️ inbox cleanup skipped: not all uploads succeeded — local file preserved");
     }
 }

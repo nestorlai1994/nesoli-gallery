@@ -34,6 +34,9 @@ async fn main() {
     let minio_user     = env::var("MINIO_USER").expect("MINIO_USER must be set");
     let minio_pass     = env::var("MINIO_PASS").expect("MINIO_PASS must be set");
     let minio_bucket   = env::var("MINIO_BUCKET").unwrap_or_else(|_| "gallery".to_string());
+    let inbox_cleanup  = env::var("INBOX_CLEANUP")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
 
     let pool = db::create_pool(&db_url).await;
     let s3 = Arc::new(
@@ -55,7 +58,7 @@ async fn main() {
         while let Some(event) = rx.recv().await {
             match &event.kind {
                 WatchEventKind::Created | WatchEventKind::Renamed { .. } => {
-                    ingestor::ingest_image(&pool_consumer, owner_id, &event, &s3_consumer).await;
+                    ingestor::ingest_image(&pool_consumer, owner_id, &event, &s3_consumer, inbox_cleanup).await;
                 }
                 WatchEventKind::Modified => {
                     tracing::debug!(path = %event.path.display(), "✏️  image modified (skipping re-ingest)");
