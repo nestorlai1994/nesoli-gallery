@@ -3,6 +3,7 @@ mod exif;
 mod handlers;
 mod ingestor;
 mod models;
+mod processor;
 mod storage;
 mod watcher;
 

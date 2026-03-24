@@ -1,10 +1,10 @@
-use crate::{exif::extract_exif, storage::S3Storage, watcher::WatchEvent};
+use crate::{exif::extract_exif, processor, storage::S3Storage, watcher::WatchEvent};
 use sqlx::PgPool;
 use std::fs;
 use uuid::Uuid;
 
 /// Ingest a newly discovered image file into the gallery_images table,
-/// upload it to MinIO, and update storage_path to the S3 key.
+/// upload it to MinIO, generate thumbnails, and update storage_path.
 pub async fn ingest_image(pool: &PgPool, owner_id: Uuid, event: &WatchEvent, storage: &S3Storage) {
     let path = &event.path;
 
@@ -28,7 +28,7 @@ pub async fn ingest_image(pool: &PgPool, owner_id: Uuid, event: &WatchEvent, sto
 
     let metadata = extract_exif(path);
 
-    // Insert with a temporary storage_path (will update after upload)
+    // Step 1: Insert into DB
     let result: Result<Uuid, _> = sqlx::query_scalar(
         r#"
         INSERT INTO gallery_images
@@ -59,7 +59,7 @@ pub async fn ingest_image(pool: &PgPool, owner_id: Uuid, event: &WatchEvent, sto
         }
     };
 
-    // Upload to MinIO: key = {owner_id}/{image_id}/{filename}
+    // Step 2: Upload original to MinIO
     let s3_key = format!("{}/{}/{}", owner_id, id, filename);
 
     if let Err(e) = storage.upload_file(&s3_key, path, &mime_type).await {
@@ -72,18 +72,13 @@ pub async fn ingest_image(pool: &PgPool, owner_id: Uuid, event: &WatchEvent, sto
         return;
     }
 
-    // Update storage_path to the S3 key
     if let Err(e) = sqlx::query("UPDATE gallery_images SET storage_path = $1 WHERE id = $2")
         .bind(&s3_key)
         .bind(id)
         .execute(pool)
         .await
     {
-        tracing::error!(
-            id    = %id,
-            error = %e,
-            "❌ failed to update storage_path"
-        );
+        tracing::error!(id = %id, error = %e, "❌ failed to update storage_path");
         return;
     }
 
@@ -95,4 +90,47 @@ pub async fn ingest_image(pool: &PgPool, owner_id: Uuid, event: &WatchEvent, sto
         size = size_bytes,
         "✅ ingested image and uploaded to MinIO"
     );
+
+    // Step 3: Generate thumbnail + preview (non-blocking on failure)
+    match processor::generate_variants(path, id).await {
+        Ok(images) => {
+            let thumb_key = format!("{}/{}/thumb.webp", owner_id, id);
+            let preview_key = format!("{}/{}/preview.webp", owner_id, id);
+
+            let thumb_ok = storage
+                .upload_file(&thumb_key, &images.thumb_path, "image/webp")
+                .await;
+            let preview_ok = storage
+                .upload_file(&preview_key, &images.preview_path, "image/webp")
+                .await;
+
+            if let (Ok(()), Ok(())) = (&thumb_ok, &preview_ok) {
+                let update = sqlx::query(
+                    "UPDATE gallery_images SET thumbnail_path = $1, processed = true WHERE id = $2",
+                )
+                .bind(&thumb_key)
+                .bind(id)
+                .execute(pool)
+                .await;
+
+                if let Err(e) = update {
+                    tracing::error!(id = %id, error = %e, "❌ failed to update thumbnail_path");
+                } else {
+                    tracing::info!(id = %id, thumb = %thumb_key, preview = %preview_key, "✅ thumbnails uploaded");
+                }
+            } else {
+                if let Err(e) = thumb_ok {
+                    tracing::error!(id = %id, error = %e, "❌ failed to upload thumbnail");
+                }
+                if let Err(e) = preview_ok {
+                    tracing::error!(id = %id, error = %e, "❌ failed to upload preview");
+                }
+            }
+
+            processor::cleanup_work_dir(id).await;
+        }
+        Err(e) => {
+            tracing::warn!(id = %id, error = %e, "⚠️ thumbnail generation failed (image still accessible as original)");
+        }
+    }
 }
