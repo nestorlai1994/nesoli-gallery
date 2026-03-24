@@ -75,3 +75,9 @@ pub struct PaginationParams {
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
+
+/// Query parameters for watermark endpoint
+#[derive(Debug, serde::Deserialize)]
+pub struct WatermarkParams {
+    pub text: Option<String>,
+}

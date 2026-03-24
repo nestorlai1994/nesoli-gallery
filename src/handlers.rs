@@ -10,7 +10,8 @@ use std::sync::Arc;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
-use crate::models::{ImageListResponse, ImageRecord, ImageSummary, PaginationParams};
+use crate::models::{ImageListResponse, ImageRecord, ImageSummary, PaginationParams, WatermarkParams};
+use crate::processor;
 use crate::storage::S3Storage;
 
 pub async fn list_images(
@@ -134,6 +135,104 @@ async fn stream_from_minio(
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, obj.content_type)
         .header(header::CONTENT_LENGTH, obj.content_length)
+        .body(body)
+        .unwrap())
+}
+
+/// GET /api/images/:id/watermark?text=NesOli
+/// Generate a watermarked preview image on-demand (not persisted).
+pub async fn watermark_image(
+    Path(id): Path<Uuid>,
+    Query(params): Query<WatermarkParams>,
+    State(pool): State<PgPool>,
+    State(storage): State<Arc<S3Storage>>,
+) -> Result<Response, StatusCode> {
+    let text = params.text.unwrap_or_else(|| "NesOli".to_string());
+
+    // Fetch preview_path from DB
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT preview_path FROM gallery_images WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, id = %id, "failed to fetch preview_path");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+    let preview_key = row
+        .ok_or(StatusCode::NOT_FOUND)?
+        .0
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            tracing::warn!(id = %id, "preview not yet generated — cannot watermark");
+            StatusCode::NOT_FOUND
+        })?;
+
+    // Download preview to temp file
+    let request_id = format!("{}-{}", id, uuid::Uuid::new_v4());
+    let work_dir = format!("/tmp/nesoli-watermark/{}", request_id);
+    tokio::fs::create_dir_all(&work_dir)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let preview_local = std::path::PathBuf::from(&work_dir).join("preview.webp");
+
+    let obj = storage.get_object_stream(&preview_key).await.map_err(|e| {
+        tracing::error!(error = %e, id = %id, "failed to download preview from MinIO");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Write preview to local temp file for vips processing
+    let bytes = obj
+        .body
+        .collect()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to collect preview bytes");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .into_bytes();
+
+    tokio::fs::write(&preview_local, &bytes)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to write temp preview");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Generate watermarked image
+    let output_path = processor::generate_watermark(&preview_local, &text, &request_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, id = %id, "watermark generation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Stream result back
+    let file = tokio::fs::File::open(&output_path).await.map_err(|e| {
+        tracing::error!(error = %e, "failed to open watermarked file");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let file_size = file
+        .metadata()
+        .await
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    // Schedule cleanup after response is built (fire-and-forget)
+    let cleanup_id = request_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        processor::cleanup_watermark_dir(&cleanup_id).await;
+    });
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "image/webp")
+        .header(header::CONTENT_LENGTH, file_size)
         .body(body)
         .unwrap())
 }

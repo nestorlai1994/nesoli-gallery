@@ -81,3 +81,62 @@ pub async fn cleanup_work_dir(image_id: Uuid) {
         tracing::warn!(id = %image_id, error = %e, "failed to clean up work dir");
     }
 }
+
+/// Generate a watermarked image by compositing translucent text over a preview.
+/// Returns the path to the generated watermarked WebP file.
+pub async fn generate_watermark(
+    preview_path: &Path,
+    text: &str,
+    request_id: &str,
+) -> Result<PathBuf, String> {
+    let work_dir = PathBuf::from(format!("/tmp/nesoli-watermark/{}", request_id));
+    tokio::fs::create_dir_all(&work_dir)
+        .await
+        .map_err(|e| format!("failed to create watermark work dir: {e}"))?;
+
+    let text_path = work_dir.join("text.png");
+    let output_path = work_dir.join("watermarked.webp");
+
+    // 1. Render text to RGBA PNG (white text with alpha)
+    let text_result = Command::new("vips")
+        .args(["text", &text_path.to_string_lossy(), text])
+        .args(["--width", "800", "--dpi", "120", "--rgba"])
+        .output()
+        .await
+        .map_err(|e| format!("failed to spawn vips text: {e}"))?;
+
+    if !text_result.status.success() {
+        let stderr = String::from_utf8_lossy(&text_result.stderr);
+        return Err(format!("vips text failed: {}", stderr.trim()));
+    }
+
+    // 2. Composite text over preview (mode 2 = OVER)
+    let composite_result = Command::new("vips")
+        .args(["composite"])
+        .arg(format!(
+            "{} {}",
+            preview_path.display(),
+            text_path.display()
+        ))
+        .arg(&output_path)
+        .arg("2")
+        .args(["--x", "50", "--y", "50"])
+        .output()
+        .await
+        .map_err(|e| format!("failed to spawn vips composite: {e}"))?;
+
+    if !composite_result.status.success() {
+        let stderr = String::from_utf8_lossy(&composite_result.stderr);
+        return Err(format!("vips composite failed: {}", stderr.trim()));
+    }
+
+    Ok(output_path)
+}
+
+/// Clean up watermark temp directory.
+pub async fn cleanup_watermark_dir(request_id: &str) {
+    let work_dir = PathBuf::from(format!("/tmp/nesoli-watermark/{}", request_id));
+    if let Err(e) = tokio::fs::remove_dir_all(&work_dir).await {
+        tracing::warn!(request_id, error = %e, "failed to clean up watermark dir");
+    }
+}
