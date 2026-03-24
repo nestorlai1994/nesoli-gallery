@@ -106,9 +106,10 @@ pub async fn ingest_image(pool: &PgPool, owner_id: Uuid, event: &WatchEvent, sto
 
             if let (Ok(()), Ok(())) = (&thumb_ok, &preview_ok) {
                 let update = sqlx::query(
-                    "UPDATE gallery_images SET thumbnail_path = $1, processed = true WHERE id = $2",
+                    "UPDATE gallery_images SET thumbnail_path = $1, preview_path = $2, processed = true WHERE id = $3",
                 )
                 .bind(&thumb_key)
+                .bind(&preview_key)
                 .bind(id)
                 .execute(pool)
                 .await;

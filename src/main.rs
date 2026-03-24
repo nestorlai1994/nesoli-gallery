@@ -72,6 +72,8 @@ async fn main() {
         .route("/api/images", get(handlers::list_images))
         .route("/api/images/:id", get(handlers::get_image))
         .route("/api/images/:id/file", get(handlers::stream_image))
+        .route("/api/images/:id/thumbnail", get(handlers::stream_thumbnail))
+        .route("/api/images/:id/preview", get(handlers::stream_preview))
         .with_state(models::AppState { pool, storage: s3 });
 
     let addr = format!("0.0.0.0:{port}");

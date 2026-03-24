@@ -31,7 +31,7 @@ pub async fn list_images(
         })?;
 
     let images: Vec<ImageSummary> = sqlx::query_as(
-        "SELECT id, filename, mime_type, size_bytes, metadata, created_at \
+        "SELECT id, filename, mime_type, size_bytes, metadata, thumbnail_path, preview_path, created_at \
          FROM gallery_images ORDER BY created_at DESC LIMIT $1 OFFSET $2",
     )
     .bind(limit)
@@ -57,7 +57,7 @@ pub async fn get_image(
 ) -> Result<Json<ImageRecord>, StatusCode> {
     let record: ImageRecord = sqlx::query_as(
         "SELECT id, owner_id, filename, original_path, storage_path, mime_type, \
-         size_bytes, metadata, processed, thumbnail_path, photographer_id, \
+         size_bytes, metadata, processed, thumbnail_path, preview_path, photographer_id, \
          shoot_id, created_at, updated_at \
          FROM gallery_images WHERE id = $1",
     )
@@ -78,26 +78,53 @@ pub async fn stream_image(
     State(pool): State<PgPool>,
     State(storage): State<Arc<S3Storage>>,
 ) -> Result<Response, StatusCode> {
-    let row: (String,) = sqlx::query_as(
-        "SELECT storage_path FROM gallery_images WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        tracing::error!(error = %e, id = %id, "failed to fetch image storage_path");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or(StatusCode::NOT_FOUND)?;
+    stream_from_minio(id, "storage_path", &pool, &storage).await
+}
 
-    let storage_path = row.0;
-    if storage_path.is_empty() {
-        tracing::warn!(id = %id, "storage_path is empty — image not yet uploaded to MinIO");
-        return Err(StatusCode::NOT_FOUND);
-    }
+pub async fn stream_thumbnail(
+    Path(id): Path<Uuid>,
+    State(pool): State<PgPool>,
+    State(storage): State<Arc<S3Storage>>,
+) -> Result<Response, StatusCode> {
+    stream_from_minio(id, "thumbnail_path", &pool, &storage).await
+}
 
-    let obj = storage.get_object_stream(&storage_path).await.map_err(|e| {
-        tracing::error!(error = %e, id = %id, key = %storage_path, "failed to stream from MinIO");
+pub async fn stream_preview(
+    Path(id): Path<Uuid>,
+    State(pool): State<PgPool>,
+    State(storage): State<Arc<S3Storage>>,
+) -> Result<Response, StatusCode> {
+    stream_from_minio(id, "preview_path", &pool, &storage).await
+}
+
+/// Generic helper: stream any path column from MinIO.
+async fn stream_from_minio(
+    id: Uuid,
+    column: &str,
+    pool: &PgPool,
+    storage: &S3Storage,
+) -> Result<Response, StatusCode> {
+    let query = format!("SELECT {} FROM gallery_images WHERE id = $1", column);
+    let row: Option<(Option<String>,)> = sqlx::query_as(&query)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, id = %id, column, "failed to fetch path");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let key = row
+        .ok_or(StatusCode::NOT_FOUND)?
+        .0
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            tracing::warn!(id = %id, column, "path is empty or null — not yet processed");
+            StatusCode::NOT_FOUND
+        })?;
+
+    let obj = storage.get_object_stream(&key).await.map_err(|e| {
+        tracing::error!(error = %e, id = %id, key = %key, "failed to stream from MinIO");
         StatusCode::NOT_FOUND
     })?;
 

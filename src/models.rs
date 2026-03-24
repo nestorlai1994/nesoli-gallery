@@ -40,6 +40,7 @@ pub struct ImageRecord {
     pub metadata: serde_json::Value,
     pub processed: bool,
     pub thumbnail_path: Option<String>,
+    pub preview_path: Option<String>,
     pub photographer_id: Option<Uuid>,
     pub shoot_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
@@ -54,6 +55,8 @@ pub struct ImageSummary {
     pub mime_type: String,
     pub size_bytes: i64,
     pub metadata: serde_json::Value,
+    pub thumbnail_path: Option<String>,
+    pub preview_path: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
