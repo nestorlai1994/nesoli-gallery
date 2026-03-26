@@ -9,8 +9,8 @@ mod watcher;
 
 use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
-use std::{env, path::PathBuf, sync::Arc};
-use tokio::sync::mpsc;
+use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
+use tokio::{sync::mpsc, time};
 use uuid::Uuid;
 use watcher::{WatchEvent, WatchEventKind};
 
@@ -37,6 +37,18 @@ async fn main() {
     let inbox_cleanup  = env::var("INBOX_CLEANUP")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
+    let debounce_secs: u64 = env::var("INGEST_DEBOUNCE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    let quarantine_dir = PathBuf::from(
+        env::var("QUARANTINE_DIR").unwrap_or_else(|_| "/photos/quarantine".to_string()),
+    );
+
+    // Ensure quarantine directory exists
+    if let Err(e) = tokio::fs::create_dir_all(&quarantine_dir).await {
+        tracing::warn!(error = %e, path = %quarantine_dir.display(), "failed to create quarantine dir");
+    }
 
     let pool = db::create_pool(&db_url).await;
     let s3 = Arc::new(
@@ -51,20 +63,98 @@ async fn main() {
         watcher::start_watcher(watch_dir_clone, tx);
     });
 
-    // Event consumer — ingest Created/Renamed images into DB + upload to MinIO
+    // Event consumer with debounce — waits for files to stabilize before ingesting
     let pool_consumer = pool.clone();
     let s3_consumer = Arc::clone(&s3);
     tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            match &event.kind {
-                WatchEventKind::Created | WatchEventKind::Renamed { .. } => {
-                    ingestor::ingest_image(&pool_consumer, owner_id, &event, &s3_consumer, inbox_cleanup).await;
+        // Tracks pending files: path → (last_seen_size, last_change_time, original_event)
+        let mut pending: HashMap<PathBuf, (u64, time::Instant, WatchEvent)> = HashMap::new();
+        let mut tick = time::interval(time::Duration::from_secs(1));
+        let debounce = time::Duration::from_secs(debounce_secs);
+
+        loop {
+            tokio::select! {
+                Some(event) = rx.recv() => {
+                    match &event.kind {
+                        WatchEventKind::Created | WatchEventKind::Renamed { .. } => {
+                            let size = tokio::fs::metadata(&event.path)
+                                .await
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            tracing::debug!(
+                                path = %event.path.display(),
+                                size,
+                                "📥 file detected, starting debounce"
+                            );
+                            pending.insert(event.path.clone(), (size, time::Instant::now(), event));
+                        }
+                        WatchEventKind::Modified => {
+                            // If file is in debounce, update its size + timestamp
+                            if let Some(entry) = pending.get_mut(&event.path) {
+                                let new_size = tokio::fs::metadata(&event.path)
+                                    .await
+                                    .map(|m| m.len())
+                                    .unwrap_or(0);
+                                if new_size != entry.0 {
+                                    entry.0 = new_size;
+                                    entry.1 = time::Instant::now();
+                                    tracing::debug!(
+                                        path = %event.path.display(),
+                                        size = new_size,
+                                        "📝 file still copying, debounce reset"
+                                    );
+                                }
+                            }
+                        }
+                        WatchEventKind::Deleted => {
+                            pending.remove(&event.path);
+                            tracing::info!(path = %event.path.display(), "🗑️  image deleted");
+                        }
+                    }
                 }
-                WatchEventKind::Modified => {
-                    tracing::debug!(path = %event.path.display(), "✏️  image modified (skipping re-ingest)");
-                }
-                WatchEventKind::Deleted => {
-                    tracing::info!(path = %event.path.display(), "🗑️  image deleted");
+                _ = tick.tick() => {
+                    // Check each pending file for stability
+                    let now = time::Instant::now();
+                    let ready: Vec<PathBuf> = pending
+                        .iter()
+                        .filter(|(_, (_, last_change, _))| now.duration_since(*last_change) >= debounce)
+                        .map(|(path, _)| path.clone())
+                        .collect();
+
+                    for path in ready {
+                        if let Some((size, _, event)) = pending.remove(&path) {
+                            // Final size check — verify file still exists and size matches
+                            let current_size = tokio::fs::metadata(&path)
+                                .await
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            if current_size != size || current_size == 0 {
+                                tracing::debug!(
+                                    path = %path.display(),
+                                    expected = size,
+                                    actual = current_size,
+                                    "⏳ size changed during final check, re-debouncing"
+                                );
+                                pending.insert(path, (current_size, now, event));
+                                continue;
+                            }
+
+                            tracing::info!(
+                                path = %path.display(),
+                                size,
+                                "✅ file stable, starting ingest"
+                            );
+                            ingestor::ingest_image(
+                                &pool_consumer,
+                                owner_id,
+                                &event,
+                                &s3_consumer,
+                                inbox_cleanup,
+                                &quarantine_dir,
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
         }

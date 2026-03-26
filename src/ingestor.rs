@@ -1,6 +1,6 @@
 use crate::{exif::extract_exif, processor, storage::S3Storage, watcher::WatchEvent};
 use sqlx::PgPool;
-use std::fs;
+use std::{fs, path::Path};
 use uuid::Uuid;
 
 /// Ingest a newly discovered image file into the gallery_images table,
@@ -9,13 +9,15 @@ use uuid::Uuid;
 /// Image lifecycle (strict order — data safety rule):
 ///   1. DB INSERT → 2. MinIO original → 3. DB UPDATE storage_path
 ///   → 4. generate thumb+preview → 5. MinIO thumb+preview → 6. DB UPDATE processed
-///   → 7. ONLY if inbox_cleanup=true AND all steps succeeded → delete local file
+///   → 7a. If all succeeded + inbox_cleanup → delete local file
+///   → 7b. If any step failed → move to quarantine (dead letter queue)
 pub async fn ingest_image(
     pool: &PgPool,
     owner_id: Uuid,
     event: &WatchEvent,
     storage: &S3Storage,
     inbox_cleanup: bool,
+    quarantine_dir: &Path,
 ) {
     let path = &event.path;
 
@@ -151,8 +153,8 @@ pub async fn ingest_image(
         }
     };
 
-    // Step 4: Inbox cleanup — delete local file ONLY if everything succeeded
-    if inbox_cleanup && all_uploads_ok {
+    // Step 4: File disposition — cleanup on success, quarantine on failure
+    if all_uploads_ok && inbox_cleanup {
         match tokio::fs::remove_file(path).await {
             Ok(()) => {
                 tracing::info!(id = %id, path = %path.display(), "🧹 inbox cleanup: local file deleted");
@@ -161,7 +163,26 @@ pub async fn ingest_image(
                 tracing::warn!(id = %id, path = %path.display(), error = %e, "⚠️ inbox cleanup: failed to delete local file");
             }
         }
-    } else if inbox_cleanup && !all_uploads_ok {
-        tracing::warn!(id = %id, path = %path.display(), "⚠️ inbox cleanup skipped: not all uploads succeeded — local file preserved");
+    } else if !all_uploads_ok {
+        // Move to quarantine — don't leave poison pills in the inbox
+        let quarantine_path = quarantine_dir.join(&filename);
+        match tokio::fs::rename(path, &quarantine_path).await {
+            Ok(()) => {
+                tracing::warn!(
+                    id = %id,
+                    from = %path.display(),
+                    to = %quarantine_path.display(),
+                    "☠️ quarantined: file moved to dead letter queue (ingest partially failed)"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    id = %id,
+                    path = %path.display(),
+                    error = %e,
+                    "❌ quarantine failed: file stuck in inbox"
+                );
+            }
+        }
     }
 }
