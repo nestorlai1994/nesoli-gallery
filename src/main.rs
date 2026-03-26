@@ -5,6 +5,7 @@ mod ingestor;
 mod models;
 mod processor;
 mod storage;
+mod sweeper;
 mod watcher;
 
 use axum::{routing::get, Json, Router};
@@ -44,6 +45,17 @@ async fn main() {
     let quarantine_dir = PathBuf::from(
         env::var("QUARANTINE_DIR").unwrap_or_else(|_| "/photos/quarantine".to_string()),
     );
+    let sweep_enabled = env::var("SWEEP_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let sweep_interval_hours: u64 = env::var("SWEEP_INTERVAL_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6);
+    let sweep_age_hours: u64 = env::var("SWEEP_AGE_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
 
     // Ensure quarantine directory exists
     if let Err(e) = tokio::fs::create_dir_all(&quarantine_dir).await {
@@ -66,6 +78,7 @@ async fn main() {
     // Event consumer with debounce — waits for files to stabilize before ingesting
     let pool_consumer = pool.clone();
     let s3_consumer = Arc::clone(&s3);
+    let quarantine_consumer = quarantine_dir.clone();
     tokio::spawn(async move {
         // Tracks pending files: path → (last_seen_size, last_change_time, original_event)
         let mut pending: HashMap<PathBuf, (u64, time::Instant, WatchEvent)> = HashMap::new();
@@ -150,7 +163,7 @@ async fn main() {
                                 &event,
                                 &s3_consumer,
                                 inbox_cleanup,
-                                &quarantine_dir,
+                                &quarantine_consumer,
                             )
                             .await;
                         }
@@ -159,6 +172,24 @@ async fn main() {
             }
         }
     });
+
+    // Background sweeper — retries stuck files, quarantines permanent failures
+    if sweep_enabled {
+        let sweep_pool = pool.clone();
+        let sweep_s3 = Arc::clone(&s3);
+        let sweep_watch = watch_dir.clone();
+        let sweep_quarantine = quarantine_dir.clone();
+        tokio::spawn(sweeper::run_sweeper(
+            sweep_pool,
+            sweep_s3,
+            owner_id,
+            sweep_watch,
+            sweep_quarantine,
+            inbox_cleanup,
+            std::time::Duration::from_secs(sweep_interval_hours * 3600),
+            std::time::Duration::from_secs(sweep_age_hours * 3600),
+        ));
+    }
 
     let app = Router::new()
         .route("/health", get(health))
