@@ -141,6 +141,7 @@ async fn stream_from_minio(
 
 /// GET /api/images/:id/watermark?text=NesOli
 /// Generate a watermarked preview image on-demand (not persisted).
+/// Uses `tempfile::NamedTempFile` — OS auto-deletes when stream completes.
 pub async fn watermark_image(
     Path(id): Path<Uuid>,
     Query(params): Query<WatermarkParams>,
@@ -169,21 +170,20 @@ pub async fn watermark_image(
             StatusCode::NOT_FOUND
         })?;
 
-    // Download preview to temp file
-    let request_id = format!("{}-{}", id, uuid::Uuid::new_v4());
-    let work_dir = format!("/tmp/nesoli-watermark/{}", request_id);
-    tokio::fs::create_dir_all(&work_dir)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let preview_local = std::path::PathBuf::from(&work_dir).join("preview.webp");
+    // Download preview to a temp file for vips processing
+    let mut preview_tmp = tempfile::Builder::new()
+        .suffix(".webp")
+        .tempfile()
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to create temp preview file");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let obj = storage.get_object_stream(&preview_key).await.map_err(|e| {
         tracing::error!(error = %e, id = %id, "failed to download preview from MinIO");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Write preview to local temp file for vips processing
     let bytes = obj
         .body
         .collect()
@@ -194,41 +194,40 @@ pub async fn watermark_image(
         })?
         .into_bytes();
 
-    tokio::fs::write(&preview_local, &bytes)
-        .await
-        .map_err(|e| {
+    {
+        use std::io::Write;
+        preview_tmp.write_all(&bytes).map_err(|e| {
             tracing::error!(error = %e, "failed to write temp preview");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    }
 
-    // Generate watermarked image
-    let output_path = processor::generate_watermark(&preview_local, &text, &request_id)
+    // Generate watermarked image — returns NamedTempFile (OS auto-deletes on drop)
+    let output_tmp = processor::generate_watermark(preview_tmp.path(), &text)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, id = %id, "watermark generation failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Stream result back
-    let file = tokio::fs::File::open(&output_path).await.map_err(|e| {
-        tracing::error!(error = %e, "failed to open watermarked file");
+    // Convert NamedTempFile → tokio::fs::File for async streaming
+    let std_file = output_tmp.reopen().map_err(|e| {
+        tracing::error!(error = %e, "failed to reopen watermarked file");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let file_size = file
-        .metadata()
-        .await
-        .map(|m| m.len() as i64)
-        .unwrap_or(0);
+    let file_size = std_file.metadata().map(|m| m.len() as i64).unwrap_or(0);
+    let file = tokio::fs::File::from_std(std_file);
 
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
 
-    // Schedule cleanup after response is built (fire-and-forget)
-    let cleanup_id = request_id.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        processor::cleanup_watermark_dir(&cleanup_id).await;
-    });
+    // output_tmp is moved into response scope — when Axum finishes streaming,
+    // it drops the Body → drops the stream → drops nothing extra.
+    // But output_tmp is dropped HERE at end of this function, AFTER body is built.
+    // The OS file handle from reopen() keeps the data readable even after unlink.
+    // When the reopened File is dropped (stream done), OS reclaims disk space.
+    drop(output_tmp);
+    drop(preview_tmp);
 
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, "image/webp")
