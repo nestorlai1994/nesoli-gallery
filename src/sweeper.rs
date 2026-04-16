@@ -111,7 +111,7 @@ async fn sweep_once(
 }
 
 const IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "raw", "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2",
+    "jpg", "jpeg", "png", "raw", "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2", "pef",
 ];
 
 fn is_image(path: &Path) -> bool {

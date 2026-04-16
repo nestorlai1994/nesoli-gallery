@@ -8,7 +8,7 @@ mod storage;
 mod sweeper;
 mod watcher;
 
-use axum::{routing::get, Json, Router};
+use axum::{extract::DefaultBodyLimit, routing::{delete, get, post}, Json, Router};
 use serde_json::{json, Value};
 use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
 use tokio::{sync::mpsc, time};
@@ -102,7 +102,8 @@ async fn main() {
                             pending.insert(event.path.clone(), (size, time::Instant::now(), event));
                         }
                         WatchEventKind::Modified => {
-                            // If file is in debounce, update its size + timestamp
+                            // If file is in debounce, update its size + timestamp.
+                            // If not yet tracked, start a new debounce (handles overwrites).
                             if let Some(entry) = pending.get_mut(&event.path) {
                                 let new_size = tokio::fs::metadata(&event.path)
                                     .await
@@ -116,6 +117,19 @@ async fn main() {
                                         size = new_size,
                                         "📝 file still copying, debounce reset"
                                     );
+                                }
+                            } else {
+                                let size = tokio::fs::metadata(&event.path)
+                                    .await
+                                    .map(|m| m.len())
+                                    .unwrap_or(0);
+                                if size > 0 {
+                                    tracing::debug!(
+                                        path = %event.path.display(),
+                                        size,
+                                        "📥 file modified (new or overwritten), starting debounce"
+                                    );
+                                    pending.insert(event.path.clone(), (size, time::Instant::now(), event));
                                 }
                             }
                         }
@@ -194,12 +208,14 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/images", get(handlers::list_images))
-        .route("/api/images/:id", get(handlers::get_image))
+        .route("/api/images/upload", post(handlers::upload_image))
+        .layer(DefaultBodyLimit::max(200 * 1024 * 1024)) // 200MB for RAW uploads
+        .route("/api/images/:id", get(handlers::get_image).delete(handlers::delete_image))
         .route("/api/images/:id/file", get(handlers::stream_image))
         .route("/api/images/:id/thumbnail", get(handlers::stream_thumbnail))
         .route("/api/images/:id/preview", get(handlers::stream_preview))
         .route("/api/images/:id/watermark", get(handlers::watermark_image))
-        .with_state(models::AppState { pool, storage: s3 });
+        .with_state(models::AppState { pool, storage: s3, watch_dir: watch_dir.clone() });
 
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

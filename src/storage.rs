@@ -100,4 +100,18 @@ impl S3Storage {
             content_length,
         })
     }
+
+    /// Delete an object from MinIO by key.
+    pub async fn delete_object(&self, key: &str) -> Result<(), String> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| format!("failed to delete from MinIO: {e}"))?;
+
+        tracing::info!(key = %key, bucket = %self.bucket, "deleted from MinIO");
+        Ok(())
+    }
 }

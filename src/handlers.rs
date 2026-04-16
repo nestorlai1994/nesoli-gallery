@@ -1,16 +1,17 @@
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::{header, StatusCode},
     response::Response,
     Json,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
-use crate::models::{ImageListResponse, ImageRecord, ImageSummary, PaginationParams, WatermarkParams};
+use crate::models::{AppState, ImageListResponse, ImageRecord, ImageSummary, PaginationParams, WatermarkParams};
 use crate::processor;
 use crate::storage::S3Storage;
 
@@ -234,4 +235,126 @@ pub async fn watermark_image(
         .header(header::CONTENT_LENGTH, file_size)
         .body(body)
         .unwrap())
+}
+
+/// POST /api/images/upload
+/// Accept multipart file upload, save to the watch directory, let the watcher ingest.
+pub async fn upload_image(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let watch_dir = &state.watch_dir;
+    let mut uploaded = Vec::new();
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to read multipart field");
+        StatusCode::BAD_REQUEST
+    })? {
+        let filename = match field.file_name() {
+            Some(name) => sanitize_filename(name),
+            None => continue,
+        };
+
+        if filename.is_empty() {
+            continue;
+        }
+
+        let data = field.bytes().await.map_err(|e| {
+            tracing::error!(error = %e, filename = %filename, "failed to read upload bytes");
+            StatusCode::BAD_REQUEST
+        })?;
+
+        // Write to watch directory — the file watcher will auto-ingest
+        let dest = watch_dir.join(&filename);
+        let mut file = tokio::fs::File::create(&dest).await.map_err(|e| {
+            tracing::error!(error = %e, path = %dest.display(), "failed to create upload file");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        file.write_all(&data).await.map_err(|e| {
+            tracing::error!(error = %e, path = %dest.display(), "failed to write upload data");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        file.flush().await.ok();
+
+        tracing::info!(
+            filename = %filename,
+            size = data.len(),
+            "📤 file uploaded to watch directory"
+        );
+        uploaded.push(filename);
+    }
+
+    if uploaded.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    Ok(Json(serde_json::json!({
+        "uploaded": uploaded,
+        "message": "Files saved. Processing will begin automatically."
+    })))
+}
+
+/// Sanitize a user-provided filename: keep only safe characters.
+fn sanitize_filename(name: &str) -> String {
+    let name = std::path::Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// DELETE /api/images/:id
+/// Remove image from DB, MinIO (original + thumb + preview), and local inbox.
+pub async fn delete_image(
+    Path(id): Path<Uuid>,
+    State(pool): State<PgPool>,
+    State(storage): State<Arc<S3Storage>>,
+) -> Result<StatusCode, StatusCode> {
+    // Fetch paths before deleting the DB row
+    let row: Option<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
+        "SELECT storage_path, thumbnail_path, preview_path, original_path FROM gallery_images WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, id = %id, "failed to fetch image for delete");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let (storage_path, thumb_path, preview_path, original_path) = row.ok_or(StatusCode::NOT_FOUND)?;
+
+    // Delete from MinIO (best-effort — log errors but don't fail)
+    for key in [Some(storage_path), thumb_path, preview_path].into_iter().flatten() {
+        if !key.is_empty() {
+            if let Err(e) = storage.delete_object(&key).await {
+                tracing::warn!(id = %id, key = %key, error = %e, "failed to delete from MinIO");
+            }
+        }
+    }
+
+    // Delete local file if still in inbox
+    let local = std::path::Path::new(&original_path);
+    if local.exists() {
+        if let Err(e) = tokio::fs::remove_file(local).await {
+            tracing::warn!(id = %id, path = %original_path, error = %e, "failed to delete local file");
+        }
+    }
+
+    // Delete from DB
+    sqlx::query("DELETE FROM gallery_images WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, id = %id, "failed to delete image from DB");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    tracing::info!(id = %id, "🗑️ image deleted");
+    Ok(StatusCode::NO_CONTENT)
 }

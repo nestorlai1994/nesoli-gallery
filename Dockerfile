@@ -16,7 +16,7 @@ RUN touch src/main.rs && cargo build --release
 # Runtime stage — minimal alpine image with libvips CLI for thumbnail generation
 FROM alpine:3.20
 WORKDIR /app
-RUN apk add --no-cache vips-tools libraw \
+RUN apk add --no-cache vips-tools libraw-tools \
     && addgroup -S nesoli && adduser -S nesoli -G nesoli
 COPY --from=builder /app/target/release/nesoli-gallery .
 USER nesoli

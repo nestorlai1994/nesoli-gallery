@@ -11,6 +11,7 @@ use crate::storage::S3Storage;
 pub struct AppState {
     pub pool: PgPool,
     pub storage: Arc<S3Storage>,
+    pub watch_dir: std::path::PathBuf,
 }
 
 /// Allow handlers that extract `State<PgPool>` to keep working unchanged.

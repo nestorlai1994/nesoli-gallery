@@ -7,7 +7,7 @@ use std::{
 use tokio::sync::mpsc::Sender;
 
 const IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "raw", "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2",
+    "jpg", "jpeg", "png", "raw", "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2", "pef",
 ];
 
 #[derive(Debug, Clone)]
@@ -26,6 +26,10 @@ pub struct WatchEvent {
 }
 
 fn is_image(path: &Path) -> bool {
+    // Skip files in quarantine subdirectory
+    if path.components().any(|c| c.as_os_str() == "quarantine") {
+        return false;
+    }
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| IMAGE_EXTENSIONS.contains(&e.to_lowercase().as_str()))

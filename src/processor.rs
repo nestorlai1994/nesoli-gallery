@@ -13,8 +13,67 @@ const PREVIEW_WIDTH: u32 = 1600;
 const THUMB_QUALITY: u32 = 80;
 const PREVIEW_QUALITY: u32 = 85;
 
+/// Camera RAW extensions that need dcraw preprocessing before vipsthumbnail.
+const RAW_EXTENSIONS: &[&str] = &[
+    "raw", "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2", "pef",
+];
+
+/// Check if a file is a camera RAW format.
+fn is_camera_raw(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| RAW_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Convert a camera RAW file to TIFF using dcraw_emu (libraw).
+/// Returns the path to the generated TIFF in the work directory.
+async fn dcraw_to_tiff(input_path: &Path, work_dir: &Path) -> Result<PathBuf, String> {
+    // dcraw_emu -T -w -H 0 -o 1 -q 3 <input>
+    //   -T  = output TIFF
+    //   -w  = use camera white balance
+    //   -H 0 = clip highlights
+    //   -o 1 = sRGB color space
+    //   -q 3 = AHD interpolation (best quality)
+    let result = Command::new("dcraw_emu")
+        .arg("-T")
+        .arg("-w")
+        .arg("-H")
+        .arg("0")
+        .arg("-o")
+        .arg("1")
+        .arg("-q")
+        .arg("3")
+        .arg(input_path)
+        .output()
+        .await
+        .map_err(|e| format!("failed to spawn dcraw_emu: {e}"))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(format!("dcraw_emu failed (exit {}): {}", result.status, stderr.trim()));
+    }
+
+    // dcraw_emu appends .tiff to the full filename (e.g. photo.NEF → photo.NEF.tiff)
+    let dcraw_output = PathBuf::from(format!("{}.tiff", input_path.display()));
+    let stem = input_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("cannot determine file stem")?;
+
+    // Copy (not rename — /photos and /tmp may be on different filesystems)
+    let tiff_path = work_dir.join(format!("{stem}.tiff"));
+    tokio::fs::copy(&dcraw_output, &tiff_path)
+        .await
+        .map_err(|e| format!("failed to copy dcraw output: {e}"))?;
+    let _ = tokio::fs::remove_file(&dcraw_output).await;
+
+    tracing::debug!(input = %input_path.display(), output = %tiff_path.display(), "dcraw converted RAW → TIFF");
+    Ok(tiff_path)
+}
+
 /// Generate WebP thumbnail (400px) and preview (1600px) from an original image.
-/// Uses `vipsthumbnail` CLI subprocess — avoids C-binding complexity with musl/Alpine.
+/// For camera RAW files, first converts to TIFF via dcraw.
 pub async fn generate_variants(
     input_path: &Path,
     image_id: Uuid,
@@ -24,11 +83,19 @@ pub async fn generate_variants(
         .await
         .map_err(|e| format!("failed to create work dir: {e}"))?;
 
+    // If camera RAW, preprocess with dcraw first
+    let effective_input = if is_camera_raw(input_path) {
+        tracing::info!(path = %input_path.display(), "camera RAW detected, converting via dcraw");
+        dcraw_to_tiff(input_path, &work_dir).await?
+    } else {
+        input_path.to_path_buf()
+    };
+
     let thumb_path = work_dir.join("thumb.webp");
     let preview_path = work_dir.join("preview.webp");
 
-    run_vipsthumbnail(input_path, &thumb_path, THUMB_WIDTH, THUMB_QUALITY).await?;
-    run_vipsthumbnail(input_path, &preview_path, PREVIEW_WIDTH, PREVIEW_QUALITY).await?;
+    run_vipsthumbnail(&effective_input, &thumb_path, THUMB_WIDTH, THUMB_QUALITY).await?;
+    run_vipsthumbnail(&effective_input, &preview_path, PREVIEW_WIDTH, PREVIEW_QUALITY).await?;
 
     Ok(ProcessedImages {
         thumb_path,
